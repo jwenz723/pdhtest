@@ -6,18 +6,31 @@ import (
 	"log"
 	"bufio"
 	"github.com/lxn/win"
+	"unsafe"
+	"time"
 )
 
 func main() {
 	const COUNTERS_FILE= "counters.txt"
 
-	done := make(chan struct{})
+	statusChan := make(chan bool)
+	//done := make(chan struct{})
 	countersChannel := make(chan string)
 	go readCounterConfigFile(COUNTERS_FILE, countersChannel)
-	go processCounters(countersChannel, done)
+	go processCounters(countersChannel, statusChan)
+
+	successCount := 0
+	failCount := 0
+	for success := range statusChan {
+		if success {
+			successCount++
+		} else {
+			failCount++
+		}
+	}
 	
-	<- done
-	fmt.Println("processed all counters")
+	//<- done
+	fmt.Printf("processed all counters. Success: %d. Failures: %d\n", successCount, failCount)
 }
 
 func readCounterConfigFile(file string, countersChannel chan string) {
@@ -38,35 +51,74 @@ func readCounterConfigFile(file string, countersChannel chan string) {
 	close(countersChannel)
 }
 
-func processCounters(countersChannel chan string, done chan struct{}) {
+func processCounters(countersChannel chan string, status chan bool) {
+	var queryHandle win.PDH_HQUERY
+	ret := win.PdhOpenQuery(0, 0, &queryHandle)
+	if ret != win.ERROR_SUCCESS {
+		fmt.Println("PdhOpenQuery failed")
+	}
+
+	counterHandles := map[string]*win.PDH_HCOUNTER{}
+
 	for counter := range countersChannel {
-		var queryHandle win.PDH_HQUERY
-		var counterHandle win.PDH_HCOUNTER
-
-		ret := win.PdhOpenQuery(0, 0, &queryHandle)
-		if ret != win.ERROR_SUCCESS {
-			fmt.Println("PdhOpenQuery failed", counter)
-			continue
-		}
-
+		var c win.PDH_HCOUNTER
 		ret = win.PdhValidatePath(counter)
 		if ret == win.PDH_CSTATUS_BAD_COUNTERNAME {
 			fmt.Println("PdhValidatePath failed", counter)
+			status <- false
 			continue
 		}
 
-		ret = win.PdhAddEnglishCounter(queryHandle, counter, 0, &counterHandle)
-		if ret != win.ERROR_SUCCESS {
+		ret = win.PdhAddEnglishCounter(queryHandle, counter, 0, &c)
+		if ret != win.ERROR_SUCCESS &&
+			ret != win.PDH_CSTATUS_NO_OBJECT {
 			fmt.Println("PdhAddEnglishCounter failed", counter)
+			status <- false
 			continue
 		}
 
-		ret = win.PdhCollectQueryData(queryHandle)
-		if ret != win.ERROR_SUCCESS {
-			fmt.Println("PdhCollectQueryData failed", counter)
-			continue
+		status <- true
+		counterHandles[counter] = &c
+	}
+
+	ret = win.PdhCollectQueryData(queryHandle)
+	if ret != win.ERROR_SUCCESS {
+		fmt.Println("PdhCollectQueryData failed")
+	} else {
+		// start data collection
+		for {
+			valCount := 0
+			ret := win.PdhCollectQueryData(queryHandle)
+			if ret == win.ERROR_SUCCESS {
+				for _, v := range counterHandles {
+					var bufSize uint32
+					var bufCount uint32
+					var size = uint32(unsafe.Sizeof(win.PDH_FMT_COUNTERVALUE_ITEM_DOUBLE{}))
+					var emptyBuf [1]win.PDH_FMT_COUNTERVALUE_ITEM_DOUBLE // need at least 1 addressable null ptr.
+
+					ret = win.PdhGetFormattedCounterArrayDouble(*v, &bufSize, &bufCount, &emptyBuf[0])
+					if ret == win.PDH_MORE_DATA {
+						filledBuf := make([]win.PDH_FMT_COUNTERVALUE_ITEM_DOUBLE, bufCount*size)
+						ret = win.PdhGetFormattedCounterArrayDouble(*v, &bufSize, &bufCount, &filledBuf[0])
+						if ret == win.ERROR_SUCCESS {
+							for i := 0; i < int(bufCount); i++ {
+								//c := filledBuf[i]
+								//s := win.UTF16PtrToString(c.SzName)
+								//
+								//fmt.Printf("%s[%s] = %f\n", k, s, c.FmtValue.DoubleValue)
+								valCount++
+							}
+						}
+					}
+				}
+			} else {
+				fmt.Printf("failed to obtain instances\n")
+			}
+
+			fmt.Printf("Collected %d values\n", valCount)
+			time.Sleep(1 * time.Second)
 		}
 	}
 
-	done <- struct{}{}
+	close(status)
 }
