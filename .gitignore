@@ -1,0 +1,5 @@
+.idea/*
+.scannerwork/*
+*.out
+*.xml
+*.html
