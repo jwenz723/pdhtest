@@ -1,113 +1,115 @@
 package main
 
 import (
+	"errors"
 	"fmt"
-	"os"
-	"log"
-	"bufio"
-	"github.com/lxn/win"
+	"syscall"
 	"unsafe"
 )
 
+const (
+	PDH_MORE_DATA = 0x800007D2
+	ERROR_SUCCESS = 0
+)
+
+var (
+	pdh_ParseCounterPathW *syscall.Proc
+	libpdhDll *syscall.DLL
+)
+
+type PDH_COUNTER_PATH_ELEMENTS struct {
+	MachineName *uint16
+	ObjectName *uint16
+	InstanceName *uint16
+	ParentInstance *uint16
+	InstanceIndex uint32
+	CounterName *uint16
+}
+
+type pdhCounter struct{
+	Path             	string `yaml:"Path"`   // The path to the PDH counter to be collected
+	ExcludeInstances 	[]string // A list of PDH instances to be excluded from collection
+	MachineName string
+	ObjectName string
+	InstanceName string
+	ParentInstance string
+	InstanceIndex uint32
+	CounterName string
+}
+
+func (p *pdhCounter) Print() string {
+	return fmt.Sprintf("M: %s, O: %s, I: %s, C: %s", p.MachineName, p.ObjectName, p.InstanceName, p.CounterName)
+}
+
+func init() {
+	// Library
+	libpdhDll = syscall.MustLoadDLL("pdh.dll")
+	pdh_ParseCounterPathW = libpdhDll.MustFindProc("PdhParseCounterPathW")
+}
+
 func main() {
-	const COUNTERS_FILE= "counters.txt"
-
-	statusChan := make(chan uint32)
-	countersChannel := make(chan string)
-	go readCounterConfigFile(COUNTERS_FILE, countersChannel)
-	go processCounters(countersChannel, statusChan)
-
-	statusCounts := map[uint32]int{}
-	for status := range statusChan {
-		if _, ok := statusCounts[status]; !ok {
-			statusCounts[status] = 0
-		}
-		statusCounts[status]++
+	paths := []string {
+		`\Memory\% Committed Bytes In Use`,
+		`\Memory\Available Bytes`,
+		`\PhysicalDisk(*)\Avg. Disk Bytes/Transfer`,
+		`\PhysicalDisk(*)\Avg. Disk sec/Transfer`,
+		`\PhysicalDisk(*)\Disk Bytes/sec`,
+		`\PhysicalDisk(*)\Disk Transfers/sec`,
+		`\Processor(*)\% Processor Time`,
 	}
 
-	fmt.Println("Counts of error codes:")
-	for k, v := range statusCounts {
-		fmt.Printf("\t- %x: %d\n", k, v)
-	}
-}
-
-func readCounterConfigFile(file string, countersChannel chan string) {
-	f, err := os.Open(file)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer f.Close()
-	scanner := bufio.NewScanner(f)
-
-	for scanner.Scan() {
-		countersChannel <- scanner.Text()
-	}
-	if err := scanner.Err(); err != nil {
-		fmt.Printf("error reading file (%s): %s\n", file, err)
-	}
-
-	close(countersChannel)
-}
-
-func processCounters(countersChannel chan string, status chan uint32) {
-	var queryHandle win.PDH_HQUERY
-	counterHandles := map[string]*win.PDH_HCOUNTER{}
-
-	ret := win.PdhOpenQuery(0, 0, &queryHandle)
-	if ret != win.ERROR_SUCCESS {
-		status <- ret
-	} else {
-		for counter := range countersChannel {
-			var c win.PDH_HCOUNTER
-			ret = win.PdhValidatePath(counter)
-			if ret == win.PDH_CSTATUS_BAD_COUNTERNAME {
-				status <- ret
-				continue
-			}
-
-			ret = win.PdhAddEnglishCounter(queryHandle, counter, 0, &c)
-			if ret != win.ERROR_SUCCESS {
-				status <- ret
-				continue
-			}
-
-			status <- ret
-			counterHandles[counter] = &c
-		}
-
-		ret = win.PdhCollectQueryData(queryHandle)
-		if ret != win.ERROR_SUCCESS {
-			status <- ret
+	for _, path := range paths {
+		c, err := CounterPath(path)
+		if err != nil {
+			panic(err)
 		} else {
-			counterCount := 0
-			instanceCount := 0
-			ret := win.PdhCollectQueryData(queryHandle)
-			if ret == win.ERROR_SUCCESS {
-				for _, v := range counterHandles {
-					var bufSize uint32
-					var bufCount uint32
-					var size= uint32(unsafe.Sizeof(win.PDH_FMT_COUNTERVALUE_ITEM_DOUBLE{}))
-					var emptyBuf [1]win.PDH_FMT_COUNTERVALUE_ITEM_DOUBLE // need at least 1 addressable null ptr.
-
-					ret = win.PdhGetFormattedCounterArrayDouble(*v, &bufSize, &bufCount, &emptyBuf[0])
-					if ret == win.PDH_MORE_DATA {
-						counterCount++
-						filledBuf := make([]win.PDH_FMT_COUNTERVALUE_ITEM_DOUBLE, bufCount*size)
-						ret = win.PdhGetFormattedCounterArrayDouble(*v, &bufSize, &bufCount, &filledBuf[0])
-						if ret == win.ERROR_SUCCESS {
-							for i := 0; i < int(bufCount); i++ {
-								instanceCount++
-							}
-						}
-					}
-				}
-			} else {
-				status <- ret
-			}
-
-			fmt.Printf("Counters with values: %d (%d instances)\n", counterCount, instanceCount)
+			fmt.Println(c.Print())
 		}
 	}
+}
 
-	close(status)
+func CounterPath(path string) (*pdhCounter, error) {
+	var c PDH_COUNTER_PATH_ELEMENTS
+	var b uint32
+	if ret := PdhParseCounterPath(path, nil, &b); ret == PDH_MORE_DATA {
+		if ret := PdhParseCounterPath(path, &c, &b); ret == ERROR_SUCCESS {
+			p := pdhCounter{
+				Path: path,
+				MachineName: UTF16PtrToString(c.MachineName)[2:],
+				ObjectName: UTF16PtrToString(c.ObjectName),
+				InstanceName: UTF16PtrToString(c.InstanceName),
+				ParentInstance: UTF16PtrToString(c.ParentInstance),
+				InstanceIndex: c.InstanceIndex,
+				CounterName: UTF16PtrToString(c.CounterName),
+			}
+			return &p, nil
+		} else {
+			// Failed to parse counter
+			// Possible error codes: PDH_INVALID_ARGUMENT, PDH_INVALID_PATH, PDH_MEMORY_ALLOCATION_FAILURE
+			return nil, errors.New("failed to create PdhCounter from " + path + " -> " + fmt.Sprintf("%x", ret))
+		}
+	} else {
+		// Failed to obtain buffer info
+		// Possible error codes: PDH_INVALID_ARGUMENT, PDH_INVALID_PATH, PDH_MEMORY_ALLOCATION_FAILURE
+		return nil, errors.New("failed to obtain buffer info for PdhCounter from " + path + " -> " + fmt.Sprintf("%x", ret))
+	}
+}
+
+func PdhParseCounterPath(szFullPathBuffer string, pCounterPathElements *PDH_COUNTER_PATH_ELEMENTS, pdwBufferSize *uint32) uint32 {
+	ptxt, _ := syscall.UTF16PtrFromString(szFullPathBuffer)
+
+	ret, _, _ := pdh_ParseCounterPathW.Call(
+		uintptr(unsafe.Pointer(ptxt)),
+		uintptr(unsafe.Pointer(pCounterPathElements)),
+		uintptr(unsafe.Pointer(pdwBufferSize)),
+		0)
+
+	return uint32(ret)
+}
+
+func UTF16PtrToString(s *uint16) string {
+	if s == nil {
+		return ""
+	}
+	return syscall.UTF16ToString((*[1 << 29]uint16)(unsafe.Pointer(s))[0:])
 }
